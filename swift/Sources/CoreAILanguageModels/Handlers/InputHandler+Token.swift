@@ -1,3 +1,4 @@
+#if canImport(CoreAI)
 // Synchronous token input handler for Sequential and StaticShape engines.
 //
 // Copyright 2026 Apple Inc.
@@ -109,3 +110,4 @@ public struct CompositeInputHandler<Base: SyncInputHandler>: SyncInputHandler {
         return inputs
     }
 }
+#endif

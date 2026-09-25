@@ -1,3 +1,4 @@
+#if canImport(CoreAI)
 // Copyright 2026 Apple Inc.
 //
 // Use of this source code is governed by a BSD-3-clause license that can
@@ -169,3 +170,4 @@ public struct LogProbabilities: Sendable {
         return topK.reversed().map { (tokenId: Int32($0.idx), value: Double($0.val) - logSumExp) }
     }
 }
+#endif

@@ -1,3 +1,4 @@
+#if canImport(CoreAI)
 // Copyright 2026 Apple Inc.
 //
 // Use of this source code is governed by a BSD-3-clause license that can
@@ -214,3 +215,4 @@ public protocol StaticInputHandler: Sendable {
     /// Non-mutating: handler holds no per-step state. All mutation goes into `buffers`.
     func fill(_ context: InputContext, into buffers: inout InputBuffers) throws
 }
+#endif

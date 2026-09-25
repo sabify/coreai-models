@@ -1,3 +1,4 @@
+#if canImport(CoreAI)
 // Copyright 2026 Apple Inc.
 //
 // Use of this source code is governed by a BSD-3-clause license that can
@@ -149,3 +150,4 @@ extension InputLayout {
             "No \(label) input found. Expected one of \(candidates), got \(names)")
     }
 }
+#endif

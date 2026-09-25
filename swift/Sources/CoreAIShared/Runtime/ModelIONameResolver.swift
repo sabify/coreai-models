@@ -1,3 +1,4 @@
+#if canImport(CoreAI)
 /// Shared helpers for discovering model input/output names by substring matching.
 public enum ModelIONameResolver {
     /// Finds the first name containing "pixel" or "image" (case-insensitive).
@@ -21,3 +22,4 @@ public enum ModelIONameResolver {
         names.first { $0.lowercased().contains("box") }
     }
 }
+#endif

@@ -1,3 +1,4 @@
+#if canImport(CoreAI)
 // Copyright 2026 Apple Inc.
 //
 // Use of this source code is governed by a BSD-3-clause license that can
@@ -50,3 +51,4 @@ func lastTokenLogits(from logitBuffer: [LogitsScalarType], vocabSize: Int) -> [L
     let lastTokenOffset = (tokensInBuffer - 1) * vocabSize
     return Array(logitBuffer[lastTokenOffset..<(lastTokenOffset + vocabSize)])
 }
+#endif
