@@ -532,8 +532,10 @@ public struct CoreAILanguageModel: LanguageModel {
         ) async throws {
             let schemaData = try JSONEncoder().encode(schema)
 
-            guard let jsonSchema = String(data: schemaData, encoding: .utf8) else {
-                preconditionFailure("GenerationSchema JSON encoding produced invalid UTF-8")
+            // xgrammar generates fields in the order `properties` are written,
+            // which the encoding leaves to a dictionary; the declared order wins.
+            guard let jsonSchema = DeclaredPropertyOrder.json(schemaData) else {
+                preconditionFailure("GenerationSchema JSON encoding produced invalid JSON")
             }
 
             let strategy: any DecodingStrategy
