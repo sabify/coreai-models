@@ -1,3 +1,4 @@
+#if canImport(CoreAI)
 // Copyright 2026 Apple Inc.
 //
 // Use of this source code is governed by a BSD-3-clause license that can
@@ -37,3 +38,4 @@ public func cosineSimilarity(_ a: [Float], _ b: [Float]) -> Float {
     guard denom > 0 else { return normA == normB ? 1 : 0 }
     return Float(dot / denom)
 }
+#endif

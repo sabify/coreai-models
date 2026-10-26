@@ -1,3 +1,4 @@
+#if canImport(CoreAI)
 // Additive causal attention mask for dynamic (GPU) engines.
 //
 // Copyright 2026 Apple Inc.
@@ -35,3 +36,4 @@ func makeAdditiveCausalMask(context: InputContext, descriptor: NDArrayDescriptor
     fillAdditiveCausalMask(&mask, processedTokenCount: context.processedTokenCount)
     return mask
 }
+#endif

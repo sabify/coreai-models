@@ -1,3 +1,4 @@
+#if canImport(CoreAI)
 // Asynchronous token input handler for the Pipelined engine (MTLBuffer-based).
 //
 // Copyright 2026 Apple Inc.
@@ -105,3 +106,4 @@ struct PipelinedTokenInputHandler {
         ]
     }
 }
+#endif

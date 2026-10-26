@@ -1,3 +1,4 @@
+#if canImport(CoreAI)
 // Persistent state handlers for static-shape (bucketed) engines.
 //
 // Copyright 2026 Apple Inc.
@@ -468,3 +469,4 @@ func runStaticStep(
         states: _unsafeEscapeMutableViews(consume states),
         outputViews: InferenceFunction.MutableViews())
 }
+#endif

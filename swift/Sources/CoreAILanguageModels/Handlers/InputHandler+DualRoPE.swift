@@ -1,3 +1,4 @@
+#if canImport(CoreAI)
 // Precomputed dual-RoPE cos/sin rows for static-shape models.
 //
 // Copyright 2026 Apple Inc.
@@ -142,3 +143,4 @@ struct DualRoPEInputHandler: StaticInputHandler {
         }
     }
 }
+#endif

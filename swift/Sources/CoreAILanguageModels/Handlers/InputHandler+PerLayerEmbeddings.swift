@@ -1,3 +1,4 @@
+#if canImport(CoreAI)
 // Per-Layer Embeddings input for static-shape models.
 //
 // Copyright 2026 Apple Inc.
@@ -69,3 +70,4 @@ struct PerLayerEmbeddingsInputHandler: StaticInputHandler {
         span.end()
     }
 }
+#endif

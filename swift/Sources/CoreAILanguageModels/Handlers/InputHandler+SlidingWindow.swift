@@ -1,3 +1,4 @@
+#if canImport(CoreAI)
 // Sliding-window ring-cache inputs for static-shape models.
 //
 // Copyright 2026 Apple Inc.
@@ -143,3 +144,4 @@ struct SlidingWindowInputHandler: StaticInputHandler {
         }
     }
 }
+#endif

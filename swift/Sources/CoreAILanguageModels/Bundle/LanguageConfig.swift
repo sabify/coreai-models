@@ -1,3 +1,4 @@
+#if canImport(CoreAI)
 // Copyright 2026 Apple Inc.
 //
 // Use of this source code is governed by a BSD-3-clause license that can
@@ -523,3 +524,4 @@ public enum VisionTokenMerge: String, Codable, Sendable {
     /// after that gather (Gemma 4, `StaticShapeEngine`).
     case decoderGather = "decoder_gather"
 }
+#endif

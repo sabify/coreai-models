@@ -1,3 +1,4 @@
+#if canImport(CoreAI)
 // Copyright 2026 Apple Inc.
 //
 // Use of this source code is governed by a BSD-3-clause license that can
@@ -58,3 +59,4 @@ protocol BatchedDecodeStep {
     /// Creates a session whose KV cache holds `batchSize` rows, at most `maxBatchCapacity`.
     func makeSessionState(batchSize: Int) throws -> GenerationSessionState
 }
+#endif

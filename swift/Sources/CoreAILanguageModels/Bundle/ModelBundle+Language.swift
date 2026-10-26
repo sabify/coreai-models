@@ -1,3 +1,4 @@
+#if canImport(CoreAI)
 // Copyright 2026 Apple Inc.
 //
 // Use of this source code is governed by a BSD-3-clause license that can
@@ -16,3 +17,4 @@ extension ModelBundle {
         try? LanguageModelBundle(bundle: self)
     }
 }
+#endif
