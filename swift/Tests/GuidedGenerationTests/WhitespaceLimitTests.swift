@@ -35,14 +35,16 @@ struct WhitespaceLimitTests {
         let byDefault = try createTestSession().maxWhitespaceCount
         let explicit = try session(limit: 5).maxWhitespaceCount
         let unlimited = try session(limit: nil).maxWhitespaceCount
+        let none = try session(limit: 0).maxWhitespaceCount
         #expect(byDefault == 32)
         #expect(explicit == 5)
         #expect(unlimited == nil)
+        #expect(none == 0)
     }
 
-    @Test("A limit that is not positive is rejected")
-    func nonPositiveLimitIsRejected() {
-        for bad in [0, -1, -100] {
+    @Test("A negative limit is rejected")
+    func negativeLimitIsRejected() {
+        for bad in [-1, -100] {
             #expect(throws: ConstrainedGenerationError.self) {
                 _ = try ConstrainedGenerationSession(
                     jsonSchema: sharedPersonSchema, vocabulary: sharedToyVocab, vocabType: .raw,
@@ -141,6 +143,53 @@ struct WhitespaceLimitTests {
                 #expect(accepted)
             }
         }
+    }
+
+    // MARK: - No free whitespace
+
+    @Test("With a limit of 0 the grammar writes each separator and allows no other whitespace")
+    func zeroLimitWritesTheSeparators() throws {
+        var s = try session(limit: 0)
+        let opened = feed(&s, [TestConstants.openBraceToken])
+        #expect(opened)
+        #expect(allowedTokenIDs(session: &s) == [TestConstants.quoteToken])
+        // {"name"
+        let key = feed(&s, [TestConstants.quoteToken, 10, TestConstants.quoteToken])
+        #expect(key)
+        #expect(allowedTokenIDs(session: &s) == [4])
+        // {"name":  — the space after the colon is the only token allowed
+        let colon = feed(&s, [4])
+        #expect(colon)
+        #expect(allowedTokenIDs(session: &s) == [Self.space])
+        // {"name": "John"
+        let value = feed(&s, [Self.space, TestConstants.quoteToken, 17, TestConstants.quoteToken])
+        #expect(value)
+        #expect(allowedTokenIDs(session: &s) == [5])
+        // {"name": "John",  — and the space after the comma
+        let comma = feed(&s, [5])
+        #expect(comma)
+        #expect(allowedTokenIDs(session: &s) == [Self.space])
+        // {"name": "John", "age": 25
+        let rest = feed(&s, [Self.space, TestConstants.quoteToken, 11, TestConstants.quoteToken, 4, Self.space, 38])
+        #expect(rest)
+        let afterNumber = allowedTokenIDs(session: &s)
+        #expect(afterNumber.contains(TestConstants.closeBraceToken))
+        #expect(afterNumber.isDisjoint(with: Self.whitespace))
+        let closed = feed(&s, [TestConstants.closeBraceToken])
+        #expect(closed)
+    }
+
+    @Test("With a limit of 0 the compact and the pretty-printed layouts are refused")
+    func zeroLimitRefusesOtherLayouts() throws {
+        var compact = try session(limit: 0)
+        // {"name":"John"
+        let compactRead = feed(
+            &compact, [TestConstants.openBraceToken, TestConstants.quoteToken, 10, TestConstants.quoteToken, 4,
+                       TestConstants.quoteToken])
+        #expect(!compactRead)
+        var pretty = try session(limit: 0)
+        let prettyRead = feed(&pretty, [TestConstants.openBraceToken, Self.newline])
+        #expect(!prettyRead)
     }
 
     // MARK: - Rollback and reset

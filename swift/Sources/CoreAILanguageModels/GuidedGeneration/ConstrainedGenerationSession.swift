@@ -43,7 +43,9 @@ public struct ConstrainedGenerationSession: ~Copyable {
     /// The JSON schema this session enforces.
     public let schema: String
 
-    /// Most whitespace characters allowed between two JSON tokens; nil when unlimited.
+    /// Most whitespace characters allowed between two JSON tokens; nil when unlimited. With 0 the
+    /// grammar allows none and writes the separators itself — `", "` between items and `": "` after
+    /// a key, as Python's `json.dumps` does — so a model trained on that spacing never samples them.
     public let maxWhitespaceCount: Int?
 
     /// Whether the grammar has reached a terminal state (valid JSON complete).
@@ -69,8 +71,9 @@ public struct ConstrainedGenerationSession: ~Copyable {
     ///     xgrammar allows these only at grammar-terminal states (valid JSON complete).
     ///     Pass `nil` to rely on xgrammar defaults.
     ///   - maxWhitespaceCount: Most whitespace characters allowed between two JSON tokens (default:
-    ///     ``defaultMaxWhitespaceCount``), or `nil` for no limit. Must be positive.
-    /// - Throws: `ConstrainedGenerationError` if the schema is invalid JSON or the limit is not positive
+    ///     ``defaultMaxWhitespaceCount``), 0 for the separators alone (see ``maxWhitespaceCount``), or
+    ///     `nil` for no limit. Must not be negative.
+    /// - Throws: `ConstrainedGenerationError` if the schema is invalid JSON or the limit is negative
     public init(
         jsonSchema: String,
         vocabulary: [String],
@@ -95,8 +98,9 @@ public struct ConstrainedGenerationSession: ~Copyable {
     ///   - jsonSchema: A valid JSON schema string
     ///   - tokenizerInfo: Pre-built tokenizer info (must include stop token IDs if needed)
     ///   - maxWhitespaceCount: Most whitespace characters allowed between two JSON tokens (default:
-    ///     ``defaultMaxWhitespaceCount``), or `nil` for no limit. Must be positive.
-    /// - Throws: `ConstrainedGenerationError` if the schema is invalid JSON or the limit is not positive,
+    ///     ``defaultMaxWhitespaceCount``), 0 for the separators alone (see ``maxWhitespaceCount``), or
+    ///     `nil` for no limit. Must not be negative.
+    /// - Throws: `ConstrainedGenerationError` if the schema is invalid JSON or the limit is negative,
     ///           `XGrammarError` if schema compilation fails
     public init(
         jsonSchema: String,
@@ -121,9 +125,12 @@ public struct ConstrainedGenerationSession: ~Copyable {
         self.maxWhitespaceCount = maxWhitespaceCount
         self.tokenizerInfo = tokenizerInfo
         self.compiler = GrammarCompiler(tokenizerInfo: tokenizerInfo)
-        self.compiledGrammar = try compiler.compileJSONSchema(jsonSchema)
-        self.whitespaceGuard = maxWhitespaceCount.map {
-            WhitespaceGuard(limit: $0, vocabulary: tokenizerInfo.vocabulary, vocabType: tokenizerInfo.vocabType)
+        // Without free whitespace, xgrammar's grammar writes its default separators, ", " and ": ".
+        self.compiledGrammar = try compiler.compileJSONSchema(jsonSchema, anyWhitespace: maxWhitespaceCount != 0)
+        self.whitespaceGuard = maxWhitespaceCount.flatMap { limit in
+            limit > 0
+                ? WhitespaceGuard(limit: limit, vocabulary: tokenizerInfo.vocabulary, vocabType: tokenizerInfo.vocabType)
+                : nil
         }
         self.matcher = GrammarMatcher(compiledGrammar: compiledGrammar, maxRollbackTokens: Self.maxRollbackTokens)
         self.vocabularySize = tokenizerInfo.vocabularySize
@@ -133,7 +140,7 @@ public struct ConstrainedGenerationSession: ~Copyable {
 
     /// Validate that a string is valid JSON.
     private static func validateMaxWhitespaceCount(_ limit: Int?) throws {
-        if let limit, limit <= 0 {
+        if let limit, limit < 0 {
             throw ConstrainedGenerationError.invalidMaxWhitespaceCount(limit)
         }
     }
@@ -162,8 +169,9 @@ public struct ConstrainedGenerationSession: ~Copyable {
     ///     xgrammar allows these tokens only at grammar-terminal states (valid JSON complete),
     ///     blocking them mid-generation. Pass `nil` to rely on xgrammar defaults (not recommended).
     ///   - maxWhitespaceCount: Most whitespace characters allowed between two JSON tokens (default:
-    ///     ``defaultMaxWhitespaceCount``), or `nil` for no limit. Must be positive.
-    /// - Throws: `ConstrainedGenerationError` if the schema is invalid JSON or the limit is not positive
+    ///     ``defaultMaxWhitespaceCount``), 0 for the separators alone (see ``maxWhitespaceCount``), or
+    ///     `nil` for no limit. Must not be negative.
+    /// - Throws: `ConstrainedGenerationError` if the schema is invalid JSON or the limit is negative
     public init(
         jsonSchema: String,
         tokenizer: any Tokenizer,
@@ -363,7 +371,7 @@ public enum ConstrainedGenerationError: Error, LocalizedError {
         case .invalidSchema(let schema):
             return "Invalid JSON schema: \(schema.prefix(100))..."
         case .invalidMaxWhitespaceCount(let value):
-            return "The whitespace limit must be positive, or nil for no limit (got \(value))"
+            return "The whitespace limit must not be negative; 0 allows none, nil no limit (got \(value))"
         case .generationFailed(let reason):
             return "Constrained generation failed: \(reason)"
         }

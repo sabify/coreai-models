@@ -107,7 +107,8 @@ public struct CoreAILanguageModel: LanguageModel {
     ///   chunking, or `nil` to use the model metadata or engine default.
     /// - Parameter maxWhitespaceCount: Most whitespace characters the grammar allows between
     ///   two JSON tokens during schema-guided generation. Defaults to
-    ///   ``ConstrainedGenerationSession/defaultMaxWhitespaceCount``; `nil` for no limit. The limit
+    ///   ``ConstrainedGenerationSession/defaultMaxWhitespaceCount``; `nil` for no limit; 0 for none,
+    ///   the grammar writing `", "` and `": "` itself for a model trained on that spacing. The limit
     ///   ends a model that keeps choosing whitespace after the last value, and does not change
     ///   output that stays within it.
     /// - Throws: If the asset bundle is invalid or the tokenizer fails to load.

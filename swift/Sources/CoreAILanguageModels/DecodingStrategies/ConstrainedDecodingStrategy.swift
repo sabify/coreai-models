@@ -48,7 +48,8 @@ public struct ConstrainedDecodingStrategy: DecodingStrategy {
     ///   - jsonSchema: A valid JSON schema string that constrains output structure
     ///   - vocabSize: Optional vocabulary size override. If nil, derived from tokenizer.
     ///   - maxWhitespaceCount: Most whitespace characters allowed between two JSON tokens (default:
-    ///     ``ConstrainedGenerationSession/defaultMaxWhitespaceCount``), or `nil` for no limit.
+    ///     ``ConstrainedGenerationSession/defaultMaxWhitespaceCount``), 0 for the separators alone
+    ///     (``ConstrainedGenerationSession/maxWhitespaceCount``), or `nil` for no limit.
     public init(
         jsonSchema: String, vocabSize: Int? = nil,
         maxWhitespaceCount: Int? = ConstrainedGenerationSession.defaultMaxWhitespaceCount
