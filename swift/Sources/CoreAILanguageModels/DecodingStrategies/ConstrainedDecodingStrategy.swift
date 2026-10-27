@@ -22,10 +22,12 @@ import Tokenizers
 ///
 /// When the grammar forces a run of text — a key's name and its closing quote — and the
 /// engine can return the logits after each of several tokens (``LogitRowReading``), the
-/// run is tokenized as a draft and read with the token before it in one step. Under greedy
-/// sampling each drafted token is kept only where the model, masked, picks it itself;
-/// at the first it would not, its own pick is taken. The tokens chosen are those a step
-/// per token would choose.
+/// run is tokenized as a draft and read with the token before it in one step. Where the
+/// grammar forces nothing, the draft is what followed the last few tokens where they
+/// stood before, in the prompt or the answer (``CopyDraft``): words a field copies from
+/// the capture, a name the answer already wrote. Under greedy sampling each drafted
+/// token is kept only where the model, masked, picks it itself; at the first it would
+/// not, its own pick is taken. The tokens chosen are those a step per token would choose.
 ///
 /// The engine is not reset between requests, so its token history keeps the prefix a new
 /// request shares with the last, and an engine that keeps grammar sessions
@@ -210,6 +212,41 @@ public struct ConstrainedDecodingStrategy: DecodingStrategy {
     }
 }
 
+// MARK: - Copy drafts
+
+/// Guesses the next tokens from where the last few stood before: an answer that
+/// copies the prompt's words, or repeats its own, continues as it did there. A guess
+/// costs nothing the step would not spend — it fills positions the step reads anyway
+/// — and is kept only where the model picks it itself.
+enum CopyDraft {
+    /// The longest run of last tokens looked for; shorter runs are tried after it.
+    static let longestMatch = 3
+
+    /// The tokens that followed the latest earlier stand of `history`'s last tokens,
+    /// at most `room` of them, the longest match first. A single token is matched
+    /// only where it stands once before: a common one ("the", a quote) says little
+    /// about what comes next.
+    static func tokens(after history: [Int32], room: Int) -> [Int32] {
+        guard room > 0, history.count > 1 else { return [] }
+        for length in stride(from: Swift.min(longestMatch, history.count - 1), through: 1, by: -1) {
+            let suffix = history[(history.count - length)...]
+            var latest: Int?
+            var stands = 0
+            for start in stride(from: history.count - length - 1, through: 0, by: -1)
+            where history[start..<(start + length)].elementsEqual(suffix) {
+                stands += 1
+                if latest == nil { latest = start }
+                if length > 1 || stands > 1 { break }
+            }
+            guard let start = latest, length > 1 || stands == 1 else { continue }
+            let from = start + length
+            let following = history[from..<Swift.min(from + room, history.count)]
+            if !following.isEmpty { return Array(following) }
+        }
+        return []
+    }
+}
+
 // MARK: - ConstrainedDecodedSequence
 
 extension ConstrainedDecodingStrategy {
@@ -390,16 +427,20 @@ extension ConstrainedDecodingStrategy.ConstrainedDecodedSequence {
             return accept(token, logits: raw, sampled: true)
         }
 
-        /// The tokens of the text the grammar forces next, when the model has read
-        /// everything but the token it just picked and they fit the step that reads it.
+        /// A draft to read with the token just picked, when the model has read
+        /// everything but it: the text the grammar forces next or, where it forces
+        /// none, the tokens that followed the last ones where they stood before
+        /// (``CopyDraft``). Either fits the step that reads it.
         private func draft(for drafter: any LogitRowReading) -> [Int32]? {
-            guard lastWasSampled, readCount == inputTokens.count - 1,
-                let forced = session.findJumpForwardString(), !forced.isEmpty
-            else { return nil }
+            guard lastWasSampled, readCount == inputTokens.count - 1 else { return nil }
             let room = drafter.tokensPerStep(after: readCount) - 1
             guard room > 0 else { return nil }
-            let tokens = tokenizer.encode(text: forced, addSpecialTokens: false).prefix(room).map(Int32.init)
-            return tokens.isEmpty ? nil : Array(tokens)
+            if let forced = session.findJumpForwardString(), !forced.isEmpty {
+                let tokens = tokenizer.encode(text: forced, addSpecialTokens: false).prefix(room).map(Int32.init)
+                return tokens.isEmpty ? nil : Array(tokens)
+            }
+            let copied = CopyDraft.tokens(after: inputTokens, room: room)
+            return copied.isEmpty ? nil : copied
         }
 
         /// Reads the token just picked and `draft` in one step, then keeps each

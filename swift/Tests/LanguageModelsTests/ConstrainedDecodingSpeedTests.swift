@@ -295,8 +295,9 @@ struct ConstrainedDecodingDraftTests {
          "required": ["name", "city"], "additionalProperties": false}
         """
 
-    private func decode(_ answer: [Int32]) async throws -> (tokens: [Int32], engine: ScriptedRowsEngine) {
-        let prompt: [Int32] = [72, 105]
+    private func decode(
+        _ answer: [Int32], prompt: [Int32] = [72, 105]
+    ) async throws -> (tokens: [Int32], engine: ScriptedRowsEngine) {
         let engine = ScriptedRowsEngine(script: prompt + answer, vocabularySize: characterTokens.count)
         let strategy = ConstrainedDecodingStrategy(jsonSchema: schema, vocabSize: characterTokens.count)
         let stream = try await strategy.decode(
@@ -331,6 +332,47 @@ struct ConstrainedDecodingDraftTests {
         let answer = characters(#"{"name": "Jo", "city"#) + [mergedColonToken] + characters(#"Rome"}"#)
         let (tokens, _) = try await decode(answer)
         #expect(tokens == answer)
+    }
+
+    @Test("Words the answer copies from the prompt are drafted from it and read together")
+    func copiedWordsAreDrafted() async throws {
+        let answer = characters(#"{"name": "Jo", "city": "Lisbon by the sea"}"#)
+        let copied = try await decode(answer, prompt: characters("Jo lives in Lisbon by the sea"))
+        let unseen = try await decode(answer)
+        #expect(copied.tokens == answer)
+        #expect(unseen.tokens == answer)
+        #expect(copied.engine.steps < unseen.engine.steps)
+    }
+
+    @Test("Where the answer leaves the words it copied, the model's own pick is taken")
+    func aCopyTheModelLeavesIsRefused() async throws {
+        let answer = characters(#"{"name": "Jo", "city": "Lisbon by the bay"}"#)
+        let (tokens, _) = try await decode(answer, prompt: characters("Jo lives in Lisbon by the sea"))
+        #expect(tokens == answer)
+    }
+}
+
+// MARK: - Copy drafts
+
+@Suite("Copy drafts")
+struct CopyDraftTests {
+    @Test("After the last three tokens' latest earlier stand, what followed is proposed, up to the room")
+    func longestMatchFirst() {
+        let history: [Int32] = [1, 2, 3, 4, 5, 9, 1, 2, 3, 4, 6, 7, 9, 1, 2, 3]
+        #expect(CopyDraft.tokens(after: history, room: 2) == [4, 6])
+        #expect(CopyDraft.tokens(after: history, room: 7) == [4, 6, 7, 9, 1, 2, 3])
+    }
+
+    @Test("A single token is matched only where it stands once before")
+    func singleTokenOnlyWhenUnique() {
+        #expect(CopyDraft.tokens(after: [5, 8, 9, 2, 5], room: 3) == [8, 9, 2])
+        #expect(CopyDraft.tokens(after: [5, 8, 5, 9, 5], room: 3) == [])
+    }
+
+    @Test("Nothing is proposed without room or an earlier stand")
+    func noRoomNoMatch() {
+        #expect(CopyDraft.tokens(after: [1, 2, 3, 1, 2], room: 0) == [])
+        #expect(CopyDraft.tokens(after: [1, 2, 3, 4], room: 3) == [])
     }
 }
 #endif
