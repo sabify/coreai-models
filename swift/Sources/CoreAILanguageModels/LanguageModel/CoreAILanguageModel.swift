@@ -208,6 +208,13 @@ public struct CoreAILanguageModel: LanguageModel {
         resources.unloadResources()
     }
 
+    /// Ends the generations running on this model at their next token, each with
+    /// ``GenerationStopped``; a generation that starts after the call runs on. Unlike
+    /// cancelling the task that asked, the generation ends the ordinary way.
+    public func stopRunningGenerations() {
+        resources.generationStop.stopRunning()
+    }
+
     /// Whether guided generation is available for this model. Assumes yes
     /// before an engine is loaded.
     private var isGuidedGenerationSupported: Bool {
@@ -337,6 +344,7 @@ public struct CoreAILanguageModel: LanguageModel {
             channel: LanguageModelExecutorGenerationChannel
         ) async throws {
             let tokenizer = model.tokenizer
+            let stop = resources.generationStop.ticket()
             let tokenStream = try await engine.generate(
                 with: promptTokens.map(Int32.init),
                 samplingConfiguration: samplingConfig,
@@ -370,6 +378,7 @@ public struct CoreAILanguageModel: LanguageModel {
             var reasoningTokenCount: Int = 0
 
             for try await output in tokenStream {
+                if stop.isStopped { throw GenerationStopped() }
                 let token = output.tokenId
                 if eosTokens.contains(token) {
                     tokenStream.setStopReason(.eos)
@@ -553,12 +562,14 @@ public struct CoreAILanguageModel: LanguageModel {
                 additionalEosTokenIds: model.additionalEosTokenIds
             )
 
+            var options = InferenceOptions(maxTokens: maxTokens)
+            options.stop = resources.generationStop.ticket()
             let stream = try await strategy.decode(
                 from: .tokens(promptTokens),
                 tokenizer: model.tokenizer,
                 inferenceEngine: engine,
                 samplingConfiguration: samplingConfig,
-                options: InferenceOptions(maxTokens: maxTokens),
+                options: options,
                 stopSequences: stopSequences
             )
 

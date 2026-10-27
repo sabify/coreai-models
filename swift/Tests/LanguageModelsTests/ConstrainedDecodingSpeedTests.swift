@@ -102,14 +102,16 @@ private final class ScriptedLogitsEngine: InferenceEngine, ConstrainedSessionCac
     private let script: [Int32]
     private let vocabularySize: Int
     private let log = Mutex<(reads: [Int], resets: Int)>(([], 0))
+    private let onRead: @Sendable (Int) -> Void
 
     var supportsLogits: Bool { true }
     var reads: [Int] { log.withLock { $0.reads } }
     var resets: Int { log.withLock { $0.resets } }
 
-    init(script: [Int32], vocabularySize: Int) {
+    init(script: [Int32], vocabularySize: Int, onRead: @escaping @Sendable (Int) -> Void = { _ in }) {
         self.script = script
         self.vocabularySize = vocabularySize
+        self.onRead = onRead
     }
 
     func generate(
@@ -117,7 +119,11 @@ private final class ScriptedLogitsEngine: InferenceEngine, ConstrainedSessionCac
         samplingConfiguration: SamplingConfiguration,
         inferenceOptions: InferenceOptions
     ) async throws -> Output {
-        log.withLock { $0.reads.append(input.count) }
+        let count = log.withLock {
+            $0.reads.append(input.count)
+            return $0.reads.count
+        }
+        onRead(count)
         var logits = [LogitsScalarType](repeating: 0, count: vocabularySize)
         if input.count < script.count { logits[Int(script[input.count])] = 10 }
         return Output(logits: logits)
@@ -154,14 +160,16 @@ struct ConstrainedDecodingLoopTests {
     private let tokenizer = MockTokenizer(
         vocab: Dictionary(uniqueKeysWithValues: toyVocabulary.enumerated().map { ($1, $0) }))
 
-    private func decode(on engine: ScriptedLogitsEngine) async throws -> [Int32] {
+    private func decode(
+        on engine: ScriptedLogitsEngine, options: InferenceOptions = InferenceOptions(maxTokens: 64)
+    ) async throws -> [Int32] {
         let strategy = ConstrainedDecodingStrategy(jsonSchema: personSchema, vocabSize: toyVocabulary.count)
         let stream = try await strategy.decode(
             from: .tokens(prompt.map(Int.init)),
             tokenizer: tokenizer,
             inferenceEngine: engine,
             samplingConfiguration: .greedy,
-            options: InferenceOptions(maxTokens: 64),
+            options: options,
             stopSequences: StopSequences(sequences: [])
         )
         var tokens: [Int32] = []
@@ -205,6 +213,35 @@ struct ConstrainedDecodingLoopTests {
         let keptAgain = try #require(engine.constrainedSessions.take(
             schema: personSchema, maxWhitespaceCount: ConstrainedGenerationSession.defaultMaxWhitespaceCount))
         #expect(keptAgain === kept)
+    }
+
+    @Test("A stop ends the generation at its next token, the grammar session goes back, and the next generation runs")
+    func aStopEndsTheGeneration() async throws {
+        let stop = GenerationStop()
+        let engine = ScriptedLogitsEngine(script: prompt + expectedAnswer, vocabularySize: toyVocabulary.count) {
+            if $0 == 3 { stop.stopRunning() }
+        }
+        var options = InferenceOptions(maxTokens: 64)
+        options.stop = stop.ticket()
+        await #expect(throws: GenerationStopped.self) { _ = try await decode(on: engine, options: options) }
+        #expect(engine.reads.count == 3)
+        let kept = try #require(engine.constrainedSessions.take(
+            schema: personSchema, maxWhitespaceCount: ConstrainedGenerationSession.defaultMaxWhitespaceCount))
+        engine.constrainedSessions.store(kept)
+
+        var next = InferenceOptions(maxTokens: 64)
+        next.stop = stop.ticket()
+        #expect(try await decode(on: engine, options: next) == expectedAnswer)
+    }
+
+    @Test("A stop ends the generations running when it is called, not those that start after it")
+    func ticketsBeforeAndAfterAStop() {
+        let stop = GenerationStop()
+        let running = stop.ticket()
+        #expect(!running.isStopped)
+        stop.stopRunning()
+        #expect(running.isStopped)
+        #expect(!stop.ticket().isStopped)
     }
 
     @Test("The session cache holds a few schemas, dropping the least recently stored")

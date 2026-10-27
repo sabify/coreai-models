@@ -24,6 +24,8 @@ final class ModelResources: ResourceManaging {
 
     private let state = Mutex(State())
     private let loader: @Sendable () async throws -> any InferenceEngine
+    /// Ends the generations running on the engine (``CoreAILanguageModel/stopRunningGenerations()``).
+    let generationStop = GenerationStop()
 
     /// Production initializer: loads via `CoreAIRunner` from the configuration.
     init(configuration: CoreAILanguageModel.CoreAIExecutor.Configuration) {

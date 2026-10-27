@@ -43,6 +43,8 @@ public struct InferenceOptions: Sendable {
     /// When set, engines use these token IDs instead of sampling.
     /// Used by MMLU-style evaluation to compute P(continuation|context).
     public var forcedContinuation: [Int32]?
+    /// What the generation checks before each token; nil when nothing can stop it.
+    package var stop: GenerationStop.Ticket?
 
     public init(
         maxTokens: Int? = nil,

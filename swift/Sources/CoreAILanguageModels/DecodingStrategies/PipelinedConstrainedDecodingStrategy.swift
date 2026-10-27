@@ -96,7 +96,8 @@ public struct PipelinedConstrainedDecodingStrategy: DecodingStrategy {
             tokenizer: tokenizer,
             engine: constrainedEngine,
             samplingConfiguration: samplingConfiguration,
-            stopSequences: stopSequences
+            stopSequences: stopSequences,
+            stop: options.stop
         )
     }
 }
@@ -119,6 +120,7 @@ public struct PipelinedConstrainedSequence: AsyncSequence {
     let engine: any ConstrainedGenerationCapable
     let samplingConfiguration: SamplingConfiguration
     let stopSequences: StopSequences
+    let stop: GenerationStop.Ticket?
 
     /// Guards against multiple `makeAsyncIterator()` calls sharing the same session box.
     private let consumed = SingleUseFlag()
@@ -133,7 +135,8 @@ public struct PipelinedConstrainedSequence: AsyncSequence {
             tokenizer: tokenizer,
             engine: engine,
             samplingConfiguration: samplingConfiguration,
-            stopSequences: stopSequences
+            stopSequences: stopSequences,
+            stop: stop
         )
     }
 }
@@ -148,6 +151,7 @@ extension PipelinedConstrainedSequence {
         private let samplingConfiguration: SamplingConfiguration
         private let stopSequences: StopSequences
         private let session: ConstrainedSessionHandle
+        private let stop: GenerationStop.Ticket?
 
         private let inputTokens: [Int32]
         private let maxTokens: Int
@@ -165,9 +169,11 @@ extension PipelinedConstrainedSequence {
             tokenizer: any Tokenizer,
             engine: any ConstrainedGenerationCapable,
             samplingConfiguration: SamplingConfiguration,
-            stopSequences: StopSequences
+            stopSequences: StopSequences,
+            stop: GenerationStop.Ticket?
         ) {
             self.session = session
+            self.stop = stop
             self.inputTokens = inputTokens
             self.maxTokens = maxTokens
             self.tokenizer = tokenizer
@@ -194,6 +200,7 @@ extension PipelinedConstrainedSequence {
                 var consecutiveDecodeFailures = 0
                 while true {
                     try Task.checkCancellation()
+                    if stop?.isStopped == true { throw GenerationStopped() }
 
                     // Safe to copy: AsyncThrowingStream.AsyncIterator is a class-backed
                     // reference type, so the copy shares the underlying stream state.

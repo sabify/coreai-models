@@ -99,7 +99,8 @@ public struct ConstrainedDecodingStrategy: DecodingStrategy {
                 session: session,
                 cache: cache,
                 inputTokens: inputTokens,
-                maxTokens: maxTokens
+                maxTokens: maxTokens,
+                stop: options.stop
             ),
             tokenizer: tokenizer,
             inferenceEngine: inferenceEngine,
@@ -280,12 +281,17 @@ extension ConstrainedDecodingStrategy.ConstrainedDecodedSequence {
         let cache: ConstrainedSessionCache?
         let inputTokens: [Int32]
         let maxTokens: Int
+        let stop: GenerationStop.Ticket?
 
-        init(session: ConstrainedSessionHandle, cache: ConstrainedSessionCache?, inputTokens: [Int32], maxTokens: Int) {
+        init(
+            session: ConstrainedSessionHandle, cache: ConstrainedSessionCache?, inputTokens: [Int32], maxTokens: Int,
+            stop: GenerationStop.Ticket?
+        ) {
             self.session = session
             self.cache = cache
             self.inputTokens = inputTokens
             self.maxTokens = maxTokens
+            self.stop = stop
         }
     }
 }
@@ -306,6 +312,7 @@ extension ConstrainedDecodingStrategy.ConstrainedDecodedSequence {
         private let session: ConstrainedSessionHandle
         private let cache: ConstrainedSessionCache?
         private let maxTokens: Int
+        private let stop: GenerationStop.Ticket?
         /// Reads a draft of forced tokens in one step; nil unless the engine can and
         /// sampling is greedy, where a drafted token is kept only if it is the pick.
         private let drafter: (any LogitRowReading)?
@@ -336,6 +343,7 @@ extension ConstrainedDecodingStrategy.ConstrainedDecodedSequence {
             self.cache = prepared.cache
             self.inputTokens = prepared.inputTokens
             self.maxTokens = prepared.maxTokens
+            self.stop = prepared.stop
             self.tokenizer = tokenizer
             self.inferenceEngine = inferenceEngine
             self.samplingConfiguration = samplingConfiguration
@@ -370,6 +378,7 @@ extension ConstrainedDecodingStrategy.ConstrainedDecodedSequence {
         private func nextToken() async throws -> GenerationResult? {
             guard tokenStep < maxTokens, !session.isTerminated else { return nil }
             try Task.checkCancellation()
+            if stop?.isStopped == true { throw GenerationStopped() }
 
             if let drafter, let draft = draft(for: drafter) {
                 return try await readDraft(draft, with: drafter)
