@@ -14,9 +14,16 @@ import Tokenizers
 /// Streams `GenerationResult` tokens as they are generated, enabling incremental text display.
 ///
 /// Uses xgrammar bitmask enforcement to ensure generated text conforms to a JSON schema.
-/// Each step: (1) run one inference step to get logits, (2) apply the grammar bitmask
-/// to zero out tokens that would violate the JSON schema, (3) sample from the masked
-/// logits, (4) accept the token in the grammar matcher to advance the grammar state.
+/// Each position: (1) work out the grammar bitmask for it, while the model reads the
+/// token sampled before it; (2) take a token the bitmask forces without a model step,
+/// and stop when it allows only stop tokens; (3) otherwise read every token the model
+/// has not seen in one step, mask its logits and sample; (4) accept the token in the
+/// grammar matcher to advance the grammar state. The tokens chosen are those a step per
+/// token would choose: a forced token is the only one any sampler could pick.
+///
+/// The engine is not reset between requests, so its token history keeps the prefix a new
+/// request shares with the last, and an engine that keeps grammar sessions
+/// (``ConstrainedSessionCaching``) compiles a schema once.
 public struct ConstrainedDecodingStrategy: DecodingStrategy {
     /// The JSON schema that constrains generation output.
     private let jsonSchema: String
@@ -58,25 +65,31 @@ public struct ConstrainedDecodingStrategy: DecodingStrategy {
             component: "ConstrainedDecodingStrategy"
         )
 
-        // Eager setup
-        let session = try Self.createSession(
-            jsonSchema: jsonSchema,
-            vocabSizeOverride: vocabSizeOverride,
-            tokenizer: tokenizer,
-            stopSequences: stopSequences,
-            maxWhitespaceCount: maxWhitespaceCount
-        )
+        let cache = (inferenceEngine as? any ConstrainedSessionCaching)?.constrainedSessions
+        let session: ConstrainedSessionHandle
+        if let cached = cache?.take(schema: jsonSchema, maxWhitespaceCount: maxWhitespaceCount) {
+            session = cached
+        } else {
+            session = ConstrainedSessionHandle(
+                session: try Self.createSession(
+                    jsonSchema: jsonSchema,
+                    vocabSizeOverride: vocabSizeOverride,
+                    tokenizer: tokenizer,
+                    stopSequences: stopSequences,
+                    maxWhitespaceCount: maxWhitespaceCount
+                ),
+                tokenizer: tokenizer)
+        }
         let inputTokens =
             try PromptUtils
             .maybeApplyTokenizerChatTemplate(input, tokenizer: tokenizer)
             .map(Int32.init)
         let maxTokens = options.maxTokens ?? 512
 
-        try await inferenceEngine.reset()
-
         return ConstrainedDecodedSequence(
             prepared: ConstrainedDecodedSequence.Prepared(
-                session: consume session,
+                session: session,
+                cache: cache,
                 inputTokens: inputTokens,
                 maxTokens: maxTokens
             ),
@@ -125,50 +138,22 @@ public struct ConstrainedDecodingStrategy: DecodingStrategy {
         return session
     }
 
-    /// Run one inference step: get logits, apply mask, sample, accept.
-    /// Returns `(nil, nil)` if generation should stop.
-    fileprivate static func generateOneToken(
-        inputTokens: [Int32],
-        generatedTokens: [Int32],
-        session: inout ConstrainedGenerationSession,
+    /// Read `tokens` the engine has not processed in one step and return the
+    /// logits after the last of them.
+    fileprivate static func read(
+        _ tokens: [Int32],
         inferenceEngine: any InferenceEngine,
-        samplingConfiguration: SamplingConfiguration,
-        constrainedOptions: InferenceOptions
-    ) async throws -> (Int32?, [LogitsScalarType]?) {
-        var rawLogits: [LogitsScalarType]? = nil
+        samplingConfiguration: SamplingConfiguration
+    ) async throws -> [LogitsScalarType] {
         for try await output in try await inferenceEngine.generate(
-            with: inputTokens,
+            with: tokens,
             samplingConfiguration: samplingConfiguration,
-            inferenceOptions: constrainedOptions
+            inferenceOptions: InferenceOptions(maxTokens: 1, includeLogits: true)
         ) {
-            rawLogits = output.logits
+            if let logits = output.logits { return logits }
             break
         }
-        guard let logits = rawLogits else {
-            throw ConstrainedGenerationError.generationFailed("No logits returned from engine")
-        }
-
-        var maskedLogits = logits
-        if samplingConfiguration.needsRepetitionPenalty,
-            let penalty = samplingConfiguration.repetitionPenalty
-        {
-            let window =
-                samplingConfiguration.repetitionPenaltyWindow.map { min($0, generatedTokens.count) }
-                ?? generatedTokens.count
-            RepetitionPenaltyProcessor.apply(
-                to: &maskedLogits,
-                recentTokenIds: generatedTokens.suffix(window),
-                penalty: Float(penalty)
-            )
-        }
-        _ = session.applyMask(to: &maskedLogits)
-
-        let bestToken = samplingConfiguration.sampleToken(from: &maskedLogits, step: generatedTokens.count)
-
-        if !session.acceptToken(bestToken) {
-            return (nil, nil)
-        }
-        return (bestToken, logits)
+        throw ConstrainedGenerationError.generationFailed("No logits returned from engine")
     }
 
     fileprivate static func computeTextDelta(
@@ -246,18 +231,16 @@ extension ConstrainedDecodingStrategy {
 }
 
 extension ConstrainedDecodingStrategy.ConstrainedDecodedSequence {
-    /// Holds the eagerly-created, move-only generation session together with the tokenized prompt and token budget.
+    /// The grammar session, where it goes back to, the tokenized prompt and the token budget.
     fileprivate final class Prepared {
-        var session: ConstrainedGenerationSession?
+        let session: ConstrainedSessionHandle
+        let cache: ConstrainedSessionCache?
         let inputTokens: [Int32]
         let maxTokens: Int
 
-        init(
-            session: consuming ConstrainedGenerationSession,
-            inputTokens: [Int32],
-            maxTokens: Int
-        ) {
-            self.session = consume session
+        init(session: ConstrainedSessionHandle, cache: ConstrainedSessionCache?, inputTokens: [Int32], maxTokens: Int) {
+            self.session = session
+            self.cache = cache
             self.inputTokens = inputTokens
             self.maxTokens = maxTokens
         }
@@ -269,16 +252,24 @@ extension ConstrainedDecodingStrategy.ConstrainedDecodedSequence {
         public typealias Element = GenerationResult
         public typealias Failure = Error
 
+        /// More allowed tokens than this and the position is neither forced nor
+        /// stop-only, which is all the count is asked for.
+        private static let allowedTokenLimit = 8
+
         private let tokenizer: any Tokenizer
         private let inferenceEngine: any InferenceEngine
         private let samplingConfiguration: SamplingConfiguration
         private let stopSequences: StopSequences
-        private let constrainedOptions = InferenceOptions(maxTokens: 1, includeLogits: true)
-
-        // Generation state, seeded eagerly from the prepared setup.
-        private var session: ConstrainedGenerationSession?
-        private var inputTokens: [Int32]
+        private let session: ConstrainedSessionHandle
+        private let cache: ConstrainedSessionCache?
         private let maxTokens: Int
+
+        private var inputTokens: [Int32]
+        /// How many of `inputTokens` the engine has read.
+        private var readCount = 0
+        /// Whether the last token came from the model's logits: the model reads it
+        /// whatever comes next, so the read can run beside the grammar.
+        private var lastWasSampled = false
         private var generatedTokens: [Int32] = []
         private var previousDecodedText: String = ""
         private var tokenStep: Int = 0
@@ -291,8 +282,8 @@ extension ConstrainedDecodingStrategy.ConstrainedDecodedSequence {
             samplingConfiguration: SamplingConfiguration,
             stopSequences: StopSequences
         ) {
-            // Take ownership of the move-only session prepared by `decode()`.
-            self.session = prepared.session.take()
+            self.session = prepared.session
+            self.cache = prepared.cache
             self.inputTokens = prepared.inputTokens
             self.maxTokens = prepared.maxTokens
             self.tokenizer = tokenizer
@@ -305,69 +296,104 @@ extension ConstrainedDecodingStrategy.ConstrainedDecodedSequence {
             if finished {
                 return nil
             }
-
-            while tokenStep < maxTokens {
-                try Task.checkCancellation()
-
-                guard var session = self.session.take() else {
-                    finished = true
+            do {
+                guard let result = try await nextToken() else {
+                    finish()
                     return nil
                 }
-                if session.isTerminated {
-                    finished = true
+                return result
+            } catch {
+                finish()
+                throw error
+            }
+        }
+
+        /// The next token: forced by the grammar, or sampled from the model's logits.
+        /// Every engine step started here ends before this returns.
+        private func nextToken() async throws -> GenerationResult? {
+            guard tokenStep < maxTokens, !session.isTerminated else { return nil }
+            try Task.checkCancellation()
+
+            let bitmask: [Int32]?
+            var logits: [LogitsScalarType]?
+            if lastWasSampled {
+                let (tokens, engine, sampling) = (inputTokens, inferenceEngine, samplingConfiguration)
+                async let read = ConstrainedDecodingStrategy.read(
+                    tokens, inferenceEngine: engine, samplingConfiguration: sampling)
+                bitmask = session.nextTokenBitmask()
+                logits = try await read
+                readCount = inputTokens.count
+            } else {
+                bitmask = session.nextTokenBitmask()
+            }
+            guard let bitmask else { return nil }
+
+            let vocabularySize = session.vocabularySize
+            if let allowed = ConstrainedGenerationSession.allowedTokens(
+                in: bitmask, vocabularySize: vocabularySize, limit: Self.allowedTokenLimit)
+            {
+                if !allowed.isEmpty, allowed.allSatisfy({ stopSequences.matches(recentTokens: [$0]) }) {
                     return nil
                 }
-
-                let result: (Int32?, [LogitsScalarType]?)
-                do {
-                    result = try await ConstrainedDecodingStrategy.generateOneToken(
-                        inputTokens: inputTokens,
-                        generatedTokens: generatedTokens,
-                        session: &session,
-                        inferenceEngine: inferenceEngine,
-                        samplingConfiguration: samplingConfiguration,
-                        constrainedOptions: constrainedOptions
-                    )
-                } catch {
-                    finished = true
-                    // Drop session — generation failed, no further use.
-                    throw error
+                if allowed.count == 1, let forced = allowed.first {
+                    return accept(forced, logits: nil, sampled: false)
                 }
-
-                let terminatedAfterAccept = session.isTerminated
-                self.session = consume session
-
-                guard let bestToken = result.0, let logits = result.1 else {
-                    finished = true
-                    return nil
-                }
-
-                if stopSequences.matches(recentTokens: [bestToken]) {
-                    finished = true
-                    return nil
-                }
-
-                inputTokens.append(bestToken)
-                generatedTokens.append(bestToken)
-                tokenStep += 1
-
-                if terminatedAfterAccept {
-                    finished = true
-                    return nil
-                }
-
-                let delta = ConstrainedDecodingStrategy.computeTextDelta(
-                    generatedTokens: generatedTokens,
-                    previousDecodedText: &previousDecodedText,
-                    tokenizer: tokenizer,
-                    tokenStep: tokenStep
-                )
-
-                return GenerationResult(text: delta, tokenId: bestToken, rawLogits: logits)
             }
 
+            if readCount < inputTokens.count {
+                logits = try await ConstrainedDecodingStrategy.read(
+                    inputTokens, inferenceEngine: inferenceEngine, samplingConfiguration: samplingConfiguration)
+                readCount = inputTokens.count
+            }
+            guard let raw = logits else {
+                throw ConstrainedGenerationError.generationFailed("No logits returned from engine")
+            }
+            var masked = raw
+            if samplingConfiguration.needsRepetitionPenalty,
+                let penalty = samplingConfiguration.repetitionPenalty
+            {
+                let window =
+                    samplingConfiguration.repetitionPenaltyWindow.map { Swift.min($0, generatedTokens.count) }
+                    ?? generatedTokens.count
+                RepetitionPenaltyProcessor.apply(
+                    to: &masked,
+                    recentTokenIds: generatedTokens.suffix(window),
+                    penalty: Float(penalty)
+                )
+            }
+            ConstrainedGenerationSession.apply(bitmask, to: &masked, vocabularySize: vocabularySize)
+            let token = samplingConfiguration.sampleToken(from: &masked, step: generatedTokens.count)
+            return accept(token, logits: raw, sampled: true)
+        }
+
+        /// Advance the grammar by `token` and hand it out; nil once generation ends.
+        private func accept(_ token: Int32, logits: [LogitsScalarType]?, sampled: Bool) -> GenerationResult? {
+            guard session.acceptToken(token) else { return nil }
+            let terminatedAfterAccept = session.isTerminated
+            if stopSequences.matches(recentTokens: [token]) {
+                return nil
+            }
+            inputTokens.append(token)
+            generatedTokens.append(token)
+            tokenStep += 1
+            lastWasSampled = sampled
+            if terminatedAfterAccept {
+                return nil
+            }
+            let delta = ConstrainedDecodingStrategy.computeTextDelta(
+                generatedTokens: generatedTokens,
+                previousDecodedText: &previousDecodedText,
+                tokenizer: tokenizer,
+                tokenStep: tokenStep
+            )
+            return GenerationResult(text: delta, tokenId: token, rawLogits: logits)
+        }
+
+        /// Ends generation and gives the grammar session back for the next request.
+        private func finish() {
+            guard !finished else { return }
             finished = true
-            return nil
+            cache?.store(session)
         }
     }
 }

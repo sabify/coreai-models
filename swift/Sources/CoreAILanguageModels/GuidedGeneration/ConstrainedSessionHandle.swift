@@ -4,6 +4,7 @@
 // Use of this source code is governed by a BSD-3-clause license that can
 // be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
+import Synchronization
 import Tokenizers
 
 /// Single-owner handle wrapping a `ConstrainedGenerationSession`.
@@ -37,6 +38,12 @@ package final class ConstrainedSessionHandle: @unchecked Sendable {
 
     var isTerminated: Bool { _session.isTerminated }
 
+    var vocabularySize: Int { _session.vocabularySize }
+
+    /// The next position's bitmask, or nil once the grammar is done (see
+    /// ``ConstrainedGenerationSession/nextTokenBitmask()``).
+    func nextTokenBitmask() -> [Int32]? { _session.nextTokenBitmask() }
+
     func acceptToken(_ token: Int32) -> Bool {
         _session.acceptToken(token)
     }
@@ -64,5 +71,45 @@ package final class ConstrainedSessionHandle: @unchecked Sendable {
     func tokenizeForJumpForward(_ string: String) -> [Int32] {
         tokenizer.encode(text: string).map(Int32.init)
     }
+}
+
+/// Grammar sessions an engine keeps between requests, so a schema is compiled
+/// once per loaded model rather than once per request. Building one rebuilds
+/// the tokenizer's grammar view of the whole vocabulary and compiles the schema
+/// against it, which took longer than reading the prompt.
+package final class ConstrainedSessionCache: Sendable {
+    /// Requests alternate between a few schemas (a reader's extraction and
+    /// judgment), not dozens.
+    static let capacity = 4
+
+    private let entries = Mutex<[ConstrainedSessionHandle]>([])
+
+    package init() {}
+
+    /// A session for this schema and whitespace limit, reset to its start, or nil.
+    package func take(schema: String, maxWhitespaceCount: Int?) -> ConstrainedSessionHandle? {
+        let handle = entries.withLock { entries -> ConstrainedSessionHandle? in
+            guard let index = entries.firstIndex(where: {
+                $0.matches(schema: schema, maxWhitespaceCount: maxWhitespaceCount)
+            }) else { return nil }
+            return entries.remove(at: index)
+        }
+        handle?.reset()
+        return handle
+    }
+
+    /// Keeps `handle` for the next request, dropping the least recently stored.
+    package func store(_ handle: ConstrainedSessionHandle) {
+        entries.withLock { entries in
+            entries.removeAll { $0 === handle }
+            entries.append(handle)
+            if entries.count > Self.capacity { entries.removeFirst(entries.count - Self.capacity) }
+        }
+    }
+}
+
+/// An engine that keeps grammar sessions between requests.
+package protocol ConstrainedSessionCaching: AnyObject {
+    var constrainedSessions: ConstrainedSessionCache { get }
 }
 #endif

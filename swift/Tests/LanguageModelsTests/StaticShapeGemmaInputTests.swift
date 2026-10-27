@@ -52,10 +52,17 @@ struct PrefixResumeTests {
             processed: processed, canRewind: { _ in canRewind })
     }
 
-    @Test("A request that diverges from the history restarts at 0")
-    func divergenceRestarts() {
-        // A new conversation sharing 3 tokens with a 40-token history.
-        #expect(resume(commonPrefix: 3, input: 10, history: 40, processed: 40) == 0)
+    @Test("A request that diverges from the history keeps the prefix they share")
+    func divergenceKeepsTheSharedPrefix() {
+        // A new request after the same 30-token instructions, read after a 40-token turn.
+        #expect(resume(commonPrefix: 30, input: 45, history: 40, processed: 40) == 30)
+        // Nothing shared: a restart.
+        #expect(resume(commonPrefix: 0, input: 10, history: 40, processed: 40) == 0)
+    }
+
+    @Test("A diverging request the sliding-window ring can't serve restarts at 0")
+    func divergenceRingLimitRestarts() {
+        #expect(resume(commonPrefix: 30, input: 45, history: 4000, processed: 4000, canRewind: false) == 0)
     }
 
     @Test("A request the history covers rewinds one token before the common prefix")

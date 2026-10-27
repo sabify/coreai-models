@@ -204,7 +204,7 @@ public struct ConstrainedGenerationSession: ~Copyable {
         }
         // xgrammar may signal completion either by returning false, or by filling
         // an all-zeros bitmask (no tokens allowed). Both indicate the grammar is done.
-        if !hasConstraints || bitmaskBuffer.allSatisfy({ $0 == 0 }) {
+        if !hasConstraints || Self.allowsNone(bitmaskBuffer) {
             allTokensBlocked = true
             return nil
         }
@@ -220,7 +220,7 @@ public struct ConstrainedGenerationSession: ~Copyable {
     @discardableResult
     public mutating func applyMask(to logits: inout [Float]) -> Bool {
         guard let bitmask = nextTokenBitmask() else { return false }
-        _applyBitmask(bitmask, to: &logits, vocabularySize: vocabularySize, negativeInfinity: -.infinity)
+        Self.apply(bitmask, to: &logits, vocabularySize: vocabularySize)
         return true
     }
 
@@ -304,9 +304,49 @@ extension ConstrainedGenerationSession {
     @discardableResult
     public mutating func applyMask(to logits: inout [Float16]) -> Bool {
         guard let bitmask = nextTokenBitmask() else { return false }
-        _applyBitmask(
-            bitmask, to: &logits, vocabularySize: vocabularySize, negativeInfinity: -Float16.greatestFiniteMagnitude)
+        Self.apply(bitmask, to: &logits, vocabularySize: vocabularySize)
         return true
+    }
+
+    /// Apply a bitmask from ``nextTokenBitmask()`` to Float16 logits in place,
+    /// setting disallowed tokens to `-Float16.greatestFiniteMagnitude`: the mask
+    /// can be worked out while the model computes the logits.
+    public static func apply(_ bitmask: [Int32], to logits: inout [Float16], vocabularySize: Int) {
+        bitmask.withUnsafeBufferPointer { words in
+            logits.withUnsafeMutableBufferPointer { values in
+                blockDisallowed(
+                    words, in: values, vocabularySize: vocabularySize, blocked: -Float16.greatestFiniteMagnitude)
+            }
+        }
+    }
+}
+
+private func blockDisallowed(
+    _ words: UnsafeBufferPointer<Int32>, in logits: UnsafeMutableBufferPointer<Float16>, vocabularySize: Int,
+    blocked: Float16
+) {
+    guard let mask = words.baseAddress, let values = logits.baseAddress else { return }
+    let count = min(logits.count, vocabularySize)
+    var word = 0
+    while word < words.count {
+        let first = word &* 32
+        if first >= count { break }
+        let allowed = UInt32(bitPattern: mask[word])
+        if allowed != UInt32.max {
+            let end = min(first &+ 32, count)
+            if allowed == 0 {
+                (values + first).update(repeating: blocked, count: end &- first)
+            } else {
+                var disallowed = ~allowed
+                while disallowed != 0 {
+                    let token = first &+ disallowed.trailingZeroBitCount
+                    if token >= end { break }
+                    values[token] = blocked
+                    disallowed &= disallowed &- 1
+                }
+            }
+        }
+        word &+= 1
     }
 }
 #endif
@@ -355,29 +395,85 @@ extension ConstrainedGenerationSession {
     }
 }
 
-/// Applies bitmask to logits.
-private func _applyBitmask<T: BinaryFloatingPoint>(
-    _ bitmask: [Int32],
-    to logits: inout [T],
-    vocabularySize: Int,
-    negativeInfinity negInf: T
-) {
-    let count = min(logits.count, vocabularySize)
-    for (wordIndex, mask) in bitmask.enumerated() {
-        let base = wordIndex &* 32
-        if base >= count { break }
-        if mask == 0 {
-            let end = min(base + 32, count)
-            for i in base..<end { logits[i] = negInf }
-        } else if mask == Int32(bitPattern: 0xFFFF_FFFF) {
-            continue
-        } else {
-            for bitIndex in 0..<32 {
-                let tokenId = base + bitIndex
-                if tokenId >= count { break }
-                if (mask & (1 << bitIndex)) == 0 { logits[tokenId] = negInf }
+extension ConstrainedGenerationSession {
+    /// Apply a bitmask from ``nextTokenBitmask()`` to Float logits in place
+    /// (disallowed tokens → `-.infinity`): the mask can be worked out while the
+    /// model computes the logits.
+    ///
+    /// A non-generic loop over raw buffers: the generic one this replaces spent
+    /// most of a guided step looking up type metadata in an unoptimized build.
+    public static func apply(_ bitmask: [Int32], to logits: inout [Float], vocabularySize: Int) {
+        bitmask.withUnsafeBufferPointer { words in
+            logits.withUnsafeMutableBufferPointer { values in
+                blockDisallowed(words, in: values, vocabularySize: vocabularySize, blocked: -.infinity)
             }
         }
+    }
+
+    /// The tokens `bitmask` allows when there are at most `limit` of them, in
+    /// increasing order; nil when there are more. A single allowed token is one
+    /// the grammar forces, so no model step is needed to choose it.
+    public static func allowedTokens(in bitmask: [Int32], vocabularySize: Int, limit: Int) -> [Int32]? {
+        bitmask.withUnsafeBufferPointer { words -> [Int32]? in
+            guard let mask = words.baseAddress else { return [] }
+            var found: [Int32] = []
+            var word = 0
+            while word < words.count {
+                let first = word &* 32
+                if first >= vocabularySize { break }
+                var allowed = UInt32(bitPattern: mask[word])
+                let valid = vocabularySize &- first
+                if valid < 32 { allowed &= (UInt32(1) << UInt32(valid)) &- 1 }
+                while allowed != 0 {
+                    if found.count == limit { return nil }
+                    found.append(Int32(first &+ allowed.trailingZeroBitCount))
+                    allowed &= allowed &- 1
+                }
+                word &+= 1
+            }
+            return found
+        }
+    }
+
+    static func allowsNone(_ bitmask: [Int32]) -> Bool {
+        bitmask.withUnsafeBufferPointer { words in
+            guard let mask = words.baseAddress else { return true }
+            var word = 0
+            while word < words.count {
+                if mask[word] != 0 { return false }
+                word &+= 1
+            }
+            return true
+        }
+    }
+}
+
+private func blockDisallowed(
+    _ words: UnsafeBufferPointer<Int32>, in logits: UnsafeMutableBufferPointer<Float>, vocabularySize: Int,
+    blocked: Float
+) {
+    guard let mask = words.baseAddress, let values = logits.baseAddress else { return }
+    let count = min(logits.count, vocabularySize)
+    var word = 0
+    while word < words.count {
+        let first = word &* 32
+        if first >= count { break }
+        let allowed = UInt32(bitPattern: mask[word])
+        if allowed != UInt32.max {
+            let end = min(first &+ 32, count)
+            if allowed == 0 {
+                (values + first).update(repeating: blocked, count: end &- first)
+            } else {
+                var disallowed = ~allowed
+                while disallowed != 0 {
+                    let token = first &+ disallowed.trailingZeroBitCount
+                    if token >= end { break }
+                    values[token] = blocked
+                    disallowed &= disallowed &- 1
+                }
+            }
+        }
+        word &+= 1
     }
 }
 #endif

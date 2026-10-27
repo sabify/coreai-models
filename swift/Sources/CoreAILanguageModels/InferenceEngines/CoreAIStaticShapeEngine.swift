@@ -98,6 +98,9 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
     private var history = TokenHistory()
     public private(set) var lastPrefixHitCount: Int = 0
 
+    /// Grammar sessions kept between guided requests on this model.
+    package let constrainedSessions = ConstrainedSessionCache()
+
     // Track in-flight generation via token
     private let _activeToken = Mutex<GenerationToken?>(nil)
 
@@ -821,7 +824,10 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
     /// Where a request resumes the cached sequence, or nil to continue from
     /// `processed` as is.
     ///
-    /// - A request that diverges from the history restarts at 0.
+    /// - A request that diverges from the history keeps the prefix they share
+    ///   and reads only the rest: a new request after the same instructions reads
+    ///   just its own words. It restarts at 0 when a sliding-window ring no longer
+    ///   holds that prefix's keys.
     /// - One that the history already covers rewinds one token before the common
     ///   prefix, to re-run it for the next token's logits; or restarts at 0 when a
     ///   sliding-window ring no longer holds the keys that rewind needs.
@@ -830,7 +836,10 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         canRewind: (Int) -> Bool
     ) -> Int? {
         if commonPrefix < inputCount && commonPrefix < historyCount {
-            return 0
+            // The rewind keeps no more than was processed: a token in the history
+            // was read, and the cursor never runs ahead of the history.
+            let target = Swift.min(commonPrefix, processed)
+            return canRewind(target) ? target : 0
         }
         guard processed >= inputCount else { return nil }
         let target = Swift.max(0, commonPrefix - 1)
@@ -1010,4 +1019,5 @@ extension StaticShapeEngine.GenerationSequence {
         }
     }
 }
+extension StaticShapeEngine: ConstrainedSessionCaching {}
 #endif
