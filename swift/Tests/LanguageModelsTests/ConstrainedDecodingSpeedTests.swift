@@ -225,4 +225,112 @@ struct ConstrainedDecodingLoopTests {
         #expect(cache.take(schema: handles[1].schema, maxWhitespaceCount: handles[1].maxWhitespaceCount) === handles[1])
     }
 }
+
+// MARK: - Drafts of forced text
+
+/// A character vocabulary: token `b` is the character with code `b`, as
+/// `MockTokenizer` encodes text, plus one merged token for `": "`.
+private let mergedColonToken: Int32 = 128
+private let characterTokens: [String] = (0...Int(mergedColonToken)).map { id in
+    if id == Int(mergedColonToken) { return "\": \"" }
+    return (32..<127).contains(id) ? String(UnicodeScalar(UInt8(id))) : ""
+}
+private let characterVocabulary: [String: Int] = Dictionary(
+    uniqueKeysWithValues: characterTokens.enumerated().filter { !$0.element.isEmpty }.map { ($0.element, $0.offset) })
+
+/// Logits that favour, after each token, the token a script puts next, read one
+/// step at a time or as rows; it counts both kinds of read.
+private final class ScriptedRowsEngine: InferenceEngine, LogitRowReading, @unchecked Sendable {
+    struct Config: Codable, InferenceConfiguration {
+        var maxContextLength: Int
+    }
+
+    let config = Config(maxContextLength: 4096)
+    private let script: [Int32]
+    private let vocabularySize: Int
+    private let log = Mutex<(steps: Int, rowReads: Int)>((0, 0))
+
+    var supportsLogits: Bool { true }
+    var steps: Int { log.withLock { $0.steps } }
+    var rowReads: Int { log.withLock { $0.rowReads } }
+
+    init(script: [Int32], vocabularySize: Int) {
+        self.script = script
+        self.vocabularySize = vocabularySize
+    }
+
+    private func row(after position: Int) -> [LogitsScalarType] {
+        var logits = [LogitsScalarType](repeating: 0, count: vocabularySize)
+        if position + 1 < script.count { logits[Int(script[position + 1])] = 10 }
+        return logits
+    }
+
+    func generate(
+        with input: [TokenId],
+        samplingConfiguration: SamplingConfiguration,
+        inferenceOptions: InferenceOptions
+    ) async throws -> ScriptedLogitsEngine.Output {
+        log.withLock { $0.steps += 1 }
+        return ScriptedLogitsEngine.Output(logits: row(after: input.count - 1))
+    }
+
+    func tokensPerStep(after processed: Int) -> Int { 8 - processed % 8 }
+
+    func readLogitRows(_ input: [Int32], rowCount: Int) async throws -> [[LogitsScalarType]] {
+        log.withLock {
+            $0.steps += 1
+            $0.rowReads += 1
+        }
+        return ((input.count - rowCount)..<input.count).map(row(after:))
+    }
+
+    func reset(to tokenIndex: Int) async throws {}
+}
+
+@Suite("Constrained decoding drafts")
+struct ConstrainedDecodingDraftTests {
+    private let tokenizer = MockTokenizer(vocab: characterVocabulary)
+    private let schema = """
+        {"type": "object", "properties": {"name": {"type": "string"}, "city": {"type": "string"}},
+         "required": ["name", "city"], "additionalProperties": false}
+        """
+
+    private func decode(_ answer: [Int32]) async throws -> (tokens: [Int32], engine: ScriptedRowsEngine) {
+        let prompt: [Int32] = [72, 105]
+        let engine = ScriptedRowsEngine(script: prompt + answer, vocabularySize: characterTokens.count)
+        let strategy = ConstrainedDecodingStrategy(jsonSchema: schema, vocabSize: characterTokens.count)
+        let stream = try await strategy.decode(
+            from: .tokens(prompt.map(Int.init)),
+            tokenizer: tokenizer,
+            inferenceEngine: engine,
+            samplingConfiguration: .greedy,
+            options: InferenceOptions(maxTokens: 64),
+            stopSequences: StopSequences(sequences: [])
+        )
+        var tokens: [Int32] = []
+        for try await result in stream { tokens.append(result.tokenId) }
+        return (tokens, engine)
+    }
+
+    private func characters(_ text: String) -> [Int32] { text.utf8.map(Int32.init) }
+
+    @Test("Forced text after a picked token is drafted, read in one step and kept where the model picks it")
+    func draftsAreReadInOneStep() async throws {
+        let answer = characters(#"{"name": "Jo", "city": "Rome"}"#)
+        let (tokens, engine) = try await decode(answer)
+        #expect(tokens == answer)
+        #expect(engine.rowReads > 0)
+        // Fewer reads than tokens: each key's name and closing quote, which the
+        // grammar forces once its opening quote is picked, is read in a draft.
+        #expect(engine.steps < answer.count)
+    }
+
+    @Test("Where the model picks another token than the draft, its own pick is taken")
+    func aRefusedDraftKeepsTheModelsToken() async throws {
+        // The model writes the merged `": "` after `city`; the draft spells it out.
+        let answer = characters(#"{"name": "Jo", "city"#) + [mergedColonToken] + characters(#"Rome"}"#)
+        let (tokens, _) = try await decode(answer)
+        #expect(tokens == answer)
+    }
+}
 #endif

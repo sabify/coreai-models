@@ -538,23 +538,7 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
             $0 = nil
         }
 
-        // Implicit prefix caching: resolve input against history.
-        if history.count > 0 {
-            let (matchedPrefix, _) = history.resolve(input: input)
-            // Every image position carries the same placeholder id, so a token-id match says
-            // nothing about image content: a pending image invalidates the cached prefix from
-            // its first position on.
-            let commonPrefix = Self.reusablePrefixLength(
-                matchedPrefix: matchedPrefix,
-                firstImagePosition: pendingImageEmbeddings == nil ? nil : imageTokenPositions.min())
-            if let position = Self.resumePosition(
-                commonPrefix: commonPrefix, inputCount: input.count, historyCount: history.count,
-                processed: processedTokenCount, canRewind: canRewind(to:))
-            {
-                rewind(to: position)
-            }
-            lastPrefixHitCount = commonPrefix
-        }
+        resumeFromHistory(input)
 
         let token = GenerationToken()
         _activeToken.withLock { $0 = token }
@@ -567,11 +551,44 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         )
     }
 
+    /// Implicit prefix caching: resolve `input` against the history and move the
+    /// cursor to where it resumes.
+    private func resumeFromHistory(_ input: [TokenId]) {
+        guard history.count > 0 else { return }
+        let (matchedPrefix, _) = history.resolve(input: input)
+        // Every image position carries the same placeholder id, so a token-id match says
+        // nothing about image content: a pending image invalidates the cached prefix from
+        // its first position on.
+        let commonPrefix = Self.reusablePrefixLength(
+            matchedPrefix: matchedPrefix,
+            firstImagePosition: pendingImageEmbeddings == nil ? nil : imageTokenPositions.min())
+        if let position = Self.resumePosition(
+            commonPrefix: commonPrefix, inputCount: input.count, historyCount: history.count,
+            processed: processedTokenCount, canRewind: canRewind(to:))
+        {
+            rewind(to: position)
+        }
+        lastPrefixHitCount = commonPrefix
+    }
+
     // MARK: - Inference
 
     public func inference(
         inputTokens: [Int32], samplingConfig: SamplingConfiguration, returnsLogits: Bool,
         generationStartOffset: Int = 0, step: Int = 0
+    ) async throws -> (logits: [LogitsScalarType]?, token: Int32) {
+        var rows: [[LogitsScalarType]] = []
+        return try await inference(
+            inputTokens: inputTokens, samplingConfig: samplingConfig, returnsLogits: returnsLogits,
+            generationStartOffset: generationStartOffset, step: step, rowsFrom: nil, rows: &rows)
+    }
+
+    /// The one batch loop: reads every token after `processedTokenCount`. With
+    /// `rowsFrom`, decode batches also copy the logits after each token from that
+    /// position on into `rows`, and nothing is sampled.
+    private func inference(
+        inputTokens: [Int32], samplingConfig: SamplingConfiguration, returnsLogits: Bool,
+        generationStartOffset: Int, step: Int, rowsFrom: Int?, rows: inout [[LogitsScalarType]]
     ) async throws -> (logits: [LogitsScalarType]?, token: Int32) {
         CLILogger.log("Inference: \(inputTokens.count) tokens, processed: \(processedTokenCount)")
 
@@ -640,6 +657,13 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
                     logitBuffer.withUnsafeMutableBufferPointer { destination in
                         destination.baseAddress!.update(from: source.baseAddress! + offset, count: vocabSize)
                     }
+                    if let rowsFrom {
+                        for position in Swift.max(rowsFrom, batchStartToken)...batchEndToken {
+                            let start = (position - batchStartToken) * vocabSize
+                            precondition(source.count >= start + vocabSize, "Logits output shorter than its rows")
+                            rows.append(Array(source[start..<(start + vocabSize)]))
+                        }
+                    }
                 }
                 copySpan.end()
             }
@@ -654,6 +678,12 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         // parity dumps and the sampled token see the same capped values the reference
         // implementation produces.
         let softcap = config.overrides?.finalLogitSoftcapping
+        if rowsFrom != nil {
+            if let softcap {
+                for index in rows.indices { LogitSoftcapProcessor.apply(to: &rows[index], cap: Float(softcap)) }
+            }
+            return (logits: nil, token: 0)
+        }
         var actualLogits = returnsLogits ? logitBuffer : nil
         if let softcap, actualLogits != nil {
             LogitSoftcapProcessor.apply(to: &actualLogits!, cap: Float(softcap))
@@ -1020,4 +1050,40 @@ extension StaticShapeEngine.GenerationSequence {
     }
 }
 extension StaticShapeEngine: ConstrainedSessionCaching {}
+
+extension StaticShapeEngine: LogitRowReading {
+    package func tokensPerStep(after processed: Int) -> Int {
+        guard let narrowest = decodeRungs.map(\.queryLength).min(), narrowest > 0 else { return 1 }
+        return narrowest - processed % narrowest
+    }
+
+    package func readLogitRows(_ input: [TokenId], rowCount: Int) async throws -> [[LogitsScalarType]] {
+        precondition(rowCount > 0 && rowCount <= input.count, "rowCount \(rowCount) outside the input")
+        pendingImageEmbeddings = nil
+        imageTokenPositions = []
+        _activeToken.withLock {
+            $0?.cancel()
+            $0 = nil
+        }
+        resumeFromHistory(input)
+        // Every row asked for is computed: a token already read is read again.
+        let firstRow = input.count - rowCount
+        if processedTokenCount > firstRow {
+            guard canRewind(to: firstRow) else {
+                throw InferenceRuntimeError.invalidState("Can't rewind to \(firstRow) to read its logits again")
+            }
+            rewind(to: firstRow)
+        }
+        let start = processedTokenCount
+        var rows: [[LogitsScalarType]] = []
+        _ = try await inference(
+            inputTokens: input, samplingConfig: .greedy, returnsLogits: false,
+            generationStartOffset: input.count, step: 0, rowsFrom: firstRow, rows: &rows)
+        history.append(contentsOf: input[start..<processedTokenCount])
+        guard rows.count == rowCount else {
+            throw InferenceRuntimeError.invalidState("Read \(rows.count) logit rows of \(rowCount)")
+        }
+        return rows
+    }
+}
 #endif

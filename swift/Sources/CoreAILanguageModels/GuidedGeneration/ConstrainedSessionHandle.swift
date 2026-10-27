@@ -112,4 +112,16 @@ package final class ConstrainedSessionCache: Sendable {
 package protocol ConstrainedSessionCaching: AnyObject {
     var constrainedSessions: ConstrainedSessionCache { get }
 }
+
+/// An engine that returns the logits after each of several new tokens from one
+/// step, so a draft of the tokens the grammar forces is checked in one read.
+package protocol LogitRowReading: AnyObject, Sendable {
+    /// How many new tokens after `processed` one step reads on the rung a single
+    /// new token is read with.
+    func tokensPerStep(after processed: Int) -> Int
+
+    /// Reads `input` from the prefix it shares with the engine's history and
+    /// returns the logits after each of its last `rowCount` tokens, in order.
+    func readLogitRows(_ input: [Int32], rowCount: Int) async throws -> [[LogitsScalarType]]
+}
 #endif

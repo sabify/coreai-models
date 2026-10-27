@@ -18,8 +18,14 @@ import Tokenizers
 /// token sampled before it; (2) take a token the bitmask forces without a model step,
 /// and stop when it allows only stop tokens; (3) otherwise read every token the model
 /// has not seen in one step, mask its logits and sample; (4) accept the token in the
-/// grammar matcher to advance the grammar state. The tokens chosen are those a step per
-/// token would choose: a forced token is the only one any sampler could pick.
+/// grammar matcher to advance the grammar state.
+///
+/// When the grammar forces a run of text — a key's name and its closing quote — and the
+/// engine can return the logits after each of several tokens (``LogitRowReading``), the
+/// run is tokenized as a draft and read with the token before it in one step. Under greedy
+/// sampling each drafted token is kept only where the model, masked, picks it itself;
+/// at the first it would not, its own pick is taken. The tokens chosen are those a step
+/// per token would choose.
 ///
 /// The engine is not reset between requests, so its token history keeps the prefix a new
 /// request shares with the last, and an engine that keeps grammar sessions
@@ -263,6 +269,9 @@ extension ConstrainedDecodingStrategy.ConstrainedDecodedSequence {
         private let session: ConstrainedSessionHandle
         private let cache: ConstrainedSessionCache?
         private let maxTokens: Int
+        /// Reads a draft of forced tokens in one step; nil unless the engine can and
+        /// sampling is greedy, where a drafted token is kept only if it is the pick.
+        private let drafter: (any LogitRowReading)?
 
         private var inputTokens: [Int32]
         /// How many of `inputTokens` the engine has read.
@@ -274,6 +283,10 @@ extension ConstrainedDecodingStrategy.ConstrainedDecodedSequence {
         private var previousDecodedText: String = ""
         private var tokenStep: Int = 0
         private var finished: Bool = false
+        /// Tokens a draft read already decided, handed out one per call.
+        private var decided: [GenerationResult] = []
+        /// Generation ended inside a draft read; it ends once `decided` is out.
+        private var endsAfterDecided = false
 
         fileprivate init(
             prepared: ConstrainedDecodingStrategy.ConstrainedDecodedSequence.Prepared,
@@ -290,10 +303,17 @@ extension ConstrainedDecodingStrategy.ConstrainedDecodedSequence {
             self.inferenceEngine = inferenceEngine
             self.samplingConfiguration = samplingConfiguration
             self.stopSequences = stopSequences
+            self.drafter =
+                samplingConfiguration.isGreedy && !samplingConfiguration.needsRepetitionPenalty
+                ? inferenceEngine as? any LogitRowReading : nil
         }
 
         public func next() async throws -> GenerationResult? {
-            if finished {
+            if !decided.isEmpty {
+                return decided.removeFirst()
+            }
+            if finished || endsAfterDecided {
+                finish()
                 return nil
             }
             do {
@@ -313,6 +333,10 @@ extension ConstrainedDecodingStrategy.ConstrainedDecodedSequence {
         private func nextToken() async throws -> GenerationResult? {
             guard tokenStep < maxTokens, !session.isTerminated else { return nil }
             try Task.checkCancellation()
+
+            if let drafter, let draft = draft(for: drafter) {
+                return try await readDraft(draft, with: drafter)
+            }
 
             let bitmask: [Int32]?
             var logits: [LogitsScalarType]?
@@ -364,6 +388,63 @@ extension ConstrainedDecodingStrategy.ConstrainedDecodedSequence {
             ConstrainedGenerationSession.apply(bitmask, to: &masked, vocabularySize: vocabularySize)
             let token = samplingConfiguration.sampleToken(from: &masked, step: generatedTokens.count)
             return accept(token, logits: raw, sampled: true)
+        }
+
+        /// The tokens of the text the grammar forces next, when the model has read
+        /// everything but the token it just picked and they fit the step that reads it.
+        private func draft(for drafter: any LogitRowReading) -> [Int32]? {
+            guard lastWasSampled, readCount == inputTokens.count - 1,
+                let forced = session.findJumpForwardString(), !forced.isEmpty
+            else { return nil }
+            let room = drafter.tokensPerStep(after: readCount) - 1
+            guard room > 0 else { return nil }
+            let tokens = tokenizer.encode(text: forced, addSpecialTokens: false).prefix(room).map(Int32.init)
+            return tokens.isEmpty ? nil : Array(tokens)
+        }
+
+        /// Reads the token just picked and `draft` in one step, then keeps each
+        /// drafted token the model picks itself under the grammar's mask and, at the
+        /// first it would not, the model's own pick. After a fully kept draft, the
+        /// last row gives the next token too.
+        private func readDraft(_ draft: [Int32], with drafter: any LogitRowReading) async throws -> GenerationResult? {
+            let tokens = inputTokens + draft
+            async let read = drafter.readLogitRows(tokens, rowCount: draft.count + 1)
+            var bitmask = session.nextTokenBitmask()
+            let rows = try await read
+            let firstDrafted = inputTokens.count
+            var keptDraft = 0
+            var results: [GenerationResult] = []
+            for (index, row) in rows.enumerated() {
+                guard tokenStep < maxTokens, let mask = bitmask else { break }
+                let vocabularySize = session.vocabularySize
+                if let allowed = ConstrainedGenerationSession.allowedTokens(
+                    in: mask, vocabularySize: vocabularySize, limit: Self.allowedTokenLimit),
+                    !allowed.isEmpty, allowed.allSatisfy({ stopSequences.matches(recentTokens: [$0]) })
+                {
+                    endsAfterDecided = true
+                    break
+                }
+                var masked = row
+                ConstrainedGenerationSession.apply(mask, to: &masked, vocabularySize: vocabularySize)
+                let token = samplingConfiguration.sampleToken(from: &masked, step: generatedTokens.count)
+                let isDrafted = index < draft.count && token == draft[index]
+                guard let result = accept(token, logits: row, sampled: !isDrafted) else {
+                    endsAfterDecided = true
+                    break
+                }
+                results.append(result)
+                guard isDrafted else { break }
+                keptDraft += 1
+                bitmask = session.nextTokenBitmask()
+            }
+            // The engine read the whole draft; the cursor keeps the part that was taken.
+            readCount = firstDrafted + keptDraft
+            guard !results.isEmpty else {
+                endsAfterDecided = true
+                return nil
+            }
+            decided = Array(results.dropFirst())
+            return results.first
         }
 
         /// Advance the grammar by `token` and hand it out; nil once generation ends.
